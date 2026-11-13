@@ -32,7 +32,8 @@
     "activeTab",
     "scripting",
     "storage",
-    "declarativeNetRequest"
+    "declarativeNetRequest",
+    "contextMenus"
   ],
   "host_permissions": [
     "https://*/*",

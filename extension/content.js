@@ -31,11 +31,18 @@
     cleanReaderMode: false,
     cleanReaderOriginal: null, // Stashed original DOM for toggle-back
     sentenceTransitionTimer: null,
+    lastSelection: null,
+    isSelectionMode: false,
+    elevenApiKey: '',
   };
 
-  chrome.storage?.local.get({guy_reader_sync:false,guy_reader_voice:'af_sarah'}, prefs => {
+  chrome.storage?.local.get({ guy_reader_sync: false, guy_reader_voice: 'af_sarah', guy_reader_eleven_key: '', guy_reader_speed: 1.0 }, prefs => {
     state.synchronized = prefs.guy_reader_sync;
     state.voice = prefs.guy_reader_voice;
+    state.elevenApiKey = prefs.guy_reader_eleven_key || '';
+    if (typeof prefs.guy_reader_speed === 'number' && !isNaN(prefs.guy_reader_speed)) {
+      state.speed = Math.max(0.5, Math.min(2.5, Math.round(prefs.guy_reader_speed * 10) / 10));
+    }
   });
 
   // 1. Sentence Splitting Helper
@@ -95,13 +102,53 @@
       return p1.replace(/\./g, '\uE000').replace(/!/g, '\uE001').replace(/\?/g, '\uE002') + ' ' + p2;
     });
 
-    // 10. Split on terminal punctuation and bullet clause markers: . ! ? ׃ • ▪ ▫ ◆ ◇ ✦
-    const regex = /([^.!?\n׃•▪▫◆◇✦]+(?:[.!?׃•▪▫◆◇✦]+['"”’\)\]]*|(?=[\n]|$))|[^.!?\n׃•▪▫◆◇✦]+$)/g;
+    // 10. Split on terminal punctuation, semicolons, and bullet clause markers: . ! ? ; ׃ • ▪ ▫ ◆ ◇ ✦
+    const regex = /([^.!?\n;׃•▪▫◆◇✦]+(?:[.!?;׃•▪▫◆◇✦]+['"”’\)\]]*|(?=[\n]|$))|[^.!?\n;׃•▪▫◆◇✦]+$)/g;
     const matches = text.match(regex) || [text];
 
-    return matches
+    const baseSentences = matches
       .map(s => s.replace(/\uE000/g, '.').replace(/\uE001/g, '!').replace(/\uE002/g, '?').replace(/^[•▪▫◆◇✦\s\t-]+|[•▪▫◆◇✦\s\t-]+$/gu, '').trim())
       .filter(s => s.length > 0 && /[\p{L}\p{N}]/u.test(s));
+
+    // 11. Break overly long sentences (> 200 chars) at natural comma/clause boundaries so they load fast
+    const finalSentences = [];
+    for (const s of baseSentences) {
+      let rem = s;
+      while (rem.length > 200) {
+        let depth = 0;
+        let splitAt = -1;
+        // Look for a comma or dash outside parentheses between char 90 and 195
+        for (let i = 0; i < Math.min(rem.length - 35, 195); i++) {
+          const ch = rem[i];
+          if (ch === '(' || ch === '[') depth++;
+          else if (ch === ')' || ch === ']') depth = Math.max(0, depth - 1);
+          else if (depth === 0 && i >= 90 && (ch === ',' || ch === ':' || (ch === '-' && rem[i - 1] === ' ' && rem[i + 1] === ' '))) {
+            splitAt = i + 1;
+          }
+        }
+        // Fallback if no comma found outside parens and string is very long (> 240 chars): split at word boundary around 160
+        if (splitAt < 0 && rem.length > 240) {
+          depth = 0;
+          for (let i = 100; i < Math.min(rem.length - 35, 185); i++) {
+            const ch = rem[i];
+            if (ch === '(' || ch === '[') depth++;
+            else if (ch === ')' || ch === ']') depth = Math.max(0, depth - 1);
+            else if (depth === 0 && ch === ' ') {
+              splitAt = i;
+            }
+          }
+        }
+        if (splitAt < 0) break;
+        const left = rem.slice(0, splitAt).trim();
+        const right = rem.slice(splitAt).trim();
+        if (!left || !right) break;
+        finalSentences.push(left);
+        rem = right;
+      }
+      if (rem) finalSentences.push(rem);
+    }
+
+    return finalSentences;
   }
 
   function isHebrew(text) {
@@ -257,15 +304,19 @@
       }
     }
 
-    // Fallback: If container returned nothing, scan all paragraphs in document
-    if (sentences.length === 0 && mainContainer !== document.body && !isX) {
-      const allParas = document.querySelectorAll('p, h1, h2, h3');
-      for (let el of allParas) {
+    // Fallback: If container returned nothing, scan all candidate content blocks in document
+    if (sentences.length === 0) {
+      const candidates = Array.from(document.querySelectorAll('p, h1, h2, h3, h4, blockquote, div, section, td'));
+      for (let el of candidates) {
         if (el.closest(junkSelectors)) continue;
-        if (el.closest('#guy-reader-floating-pill')) continue;
+        if (el.closest('#guy-reader-floating-pill, #guy-reader-selection-btn')) continue;
+        if (el.offsetParent === null && el.offsetWidth === 0 && el.offsetHeight === 0) continue;
+        if (el.tagName === 'DIV' || el.tagName === 'SECTION') {
+          if (el.querySelector('p, h1, h2, h3, h4, blockquote, div, section')) continue;
+        }
         const source = readableSource(el, junkSelectors);
         const fullText = source.text;
-        if (fullText.length > 10 && /[\p{L}\p{N}]/u.test(fullText)) {
+        if (fullText && fullText.length >= 10 && /[\p{L}\p{N}]/u.test(fullText)) {
           const subSentences = splitIntoSentences(fullText);
           let searchFrom = 0;
           for (let s of subSentences) {
@@ -338,21 +389,142 @@
     return 0;
   }
 
+  // Extract sentences directly from user's text selection (ensuring 100% detection regardless of DOM container tags)
+  function extractSelectionData(explicitText = null) {
+    let text = (typeof explicitText === 'string' && explicitText.trim().length > 0)
+      ? explicitText.trim()
+      : null;
+
+    let range = null;
+    const sel = window.getSelection ? window.getSelection() : null;
+    if (sel && !sel.isCollapsed && sel.rangeCount > 0) {
+      const sText = sel.toString().trim();
+      if (sText.length > 0) {
+        if (!text) text = sText;
+        try { range = sel.getRangeAt(0).cloneRange(); } catch (_) {}
+      }
+    }
+
+    if (!text && state.lastSelection && (Date.now() - (state.lastSelection.time || 0) < 120000)) {
+      text = state.lastSelection.text;
+      range = state.lastSelection.range;
+    }
+
+    if (!text || !/[\p{L}\p{N}]/u.test(text)) return null;
+
+    const subSentences = splitIntoSentences(text);
+    const sentenceTexts = subSentences.length > 0 ? subSentences : [text];
+
+    let commonEl = document.body;
+    const segments = [];
+
+    if (range) {
+      try {
+        const common = range.commonAncestorContainer;
+        commonEl = common.nodeType === 1 ? common : (common.parentElement || document.body);
+
+        if (range.startContainer === range.endContainer && range.startContainer.nodeType === 3) {
+          const node = range.startContainer;
+          const val = node.textContent.substring(range.startOffset, range.endOffset);
+          segments.push({
+            node,
+            textStart: 0,
+            textEnd: val.length,
+            nodeOffsetStart: range.startOffset
+          });
+        } else {
+          const walker = document.createTreeWalker(
+            commonEl,
+            NodeFilter.SHOW_TEXT,
+            {
+              acceptNode: (n) => {
+                try {
+                  if (range.intersectsNode && !range.intersectsNode(n)) return NodeFilter.FILTER_REJECT;
+                } catch (_) {}
+                return NodeFilter.FILTER_ACCEPT;
+              }
+            }
+          );
+          let curr;
+          let accum = '';
+          while ((curr = walker.nextNode())) {
+            const sOff = (curr === range.startContainer) ? range.startOffset : 0;
+            const eOff = (curr === range.endContainer) ? range.endOffset : curr.textContent.length;
+            if (eOff > sOff) {
+              const val = curr.textContent.substring(sOff, eOff);
+              if (accum && !/\s$/u.test(accum) && !/^\s/u.test(val)) {
+                accum += ' ';
+              }
+              const sStart = accum.length;
+              accum += val;
+              segments.push({
+                node: curr,
+                textStart: sStart,
+                textEnd: accum.length,
+                nodeOffsetStart: sOff
+              });
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    const sentences = [];
+    let searchFrom = 0;
+    for (const s of sentenceTexts) {
+      const start = text.indexOf(s, searchFrom);
+      const sStart = start >= 0 ? start : searchFrom;
+      const sEnd = sStart + s.length;
+      searchFrom = sEnd;
+
+      sentences.push({
+        start: sStart,
+        end: sEnd,
+        text: s,
+        element: commonEl,
+        originalText: text,
+        source: { text, segments, isSelection: true }
+      });
+    }
+
+    return sentences.length > 0 ? sentences : null;
+  }
+
   // Ranges highlight the original DOM without wrapping, rewriting, or shifting text.
   function sourceRange(item, offset, length) {
     if (!item || !document.createRange) return null;
     const start = item.start + offset, end = start + length;
     const segments = item.source?.segments || [];
+    if (segments.length === 0) {
+      if (item.element && item.element !== document.body) {
+        try {
+          const r = document.createRange();
+          r.selectNodeContents(item.element);
+          return r;
+        } catch (_) {}
+      }
+      return null;
+    }
     const startSegment = segments.find(s => start >= s.textStart && start < s.textEnd) ||
       segments.find(s => s.textStart > start);
     const endSegment = [...segments].reverse().find(s => end > s.textStart && end <= s.textEnd) ||
-      [...segments].reverse().find(s => s.textEnd < end);
+      [...segments].reverse().find(s => end > s.textEnd < end);
     if (!startSegment || !endSegment) return null;
-    const startOffset = Math.max(0, start - startSegment.textStart);
-    const endOffset = Math.min(endSegment.node.textContent.length, end - endSegment.textStart);
-    const range = document.createRange();
-    range.setStart(startSegment.node, startOffset); range.setEnd(endSegment.node, endOffset);
-    return range;
+    const sOffsetStart = startSegment.nodeOffsetStart || 0;
+    const eOffsetStart = endSegment.nodeOffsetStart || 0;
+    const startOffset = Math.max(0, start - startSegment.textStart) + sOffsetStart;
+    const endOffset = Math.min(
+      endSegment.node.textContent.length,
+      (end - endSegment.textStart) + eOffsetStart
+    );
+    try {
+      const range = document.createRange();
+      range.setStart(startSegment.node, Math.min(startOffset, startSegment.node.textContent.length));
+      range.setEnd(endSegment.node, Math.min(Math.max(startOffset, endOffset), endSegment.node.textContent.length));
+      return range;
+    } catch (_) {
+      return null;
+    }
   }
 
   function paintRange(name, range) {
@@ -365,6 +537,11 @@
   function clearOnPageHighlights() {
     paintRange('guy-reader-sentence', null);
     paintRange('guy-reader-word', null);
+    const overlay = document.getElementById('guy-reader-clean-overlay');
+    if (overlay) {
+      overlay.querySelectorAll('.guy-reader-sentence-active').forEach(el => el.classList.remove('guy-reader-sentence-active'));
+      overlay.querySelectorAll('.guy-reader-word-active').forEach(el => el.classList.remove('guy-reader-word-active'));
+    }
   }
 
   function highlightSentenceOnPage(index) {
@@ -372,7 +549,21 @@
     const item = state.sentences[index];
     if (!item) return;
     paintRange('guy-reader-sentence', sourceRange(item, 0, item.text.length));
-    const rect = item.element.getBoundingClientRect?.();
+
+    const overlay = document.getElementById('guy-reader-clean-overlay');
+    if (overlay) {
+      const cleanSent = overlay.querySelector(`[data-guy-sentence="${index}"]`);
+      if (cleanSent) {
+        cleanSent.classList.add('guy-reader-sentence-active');
+        const oRect = cleanSent.getBoundingClientRect();
+        if (oRect.top < 100 || oRect.bottom > window.innerHeight - 100) {
+          cleanSent.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }
+      return;
+    }
+
+    const rect = item.element?.getBoundingClientRect?.();
     if (rect && (rect.top < 0 || rect.bottom > window.innerHeight)) {
       item.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
@@ -386,6 +577,15 @@
     if (word) {
       state.wordOffset = word.index;
       paintRange('guy-reader-word', sourceRange(item, word.index, word[0].length));
+
+      const overlay = document.getElementById('guy-reader-clean-overlay');
+      if (overlay) {
+        overlay.querySelectorAll('.guy-reader-word-active').forEach(el => el.classList.remove('guy-reader-word-active'));
+        const cleanWord = overlay.querySelector(`[data-guy-sentence="${state.currentIndex}"] [data-guy-word="${word.index}"]`);
+        if (cleanWord) {
+          cleanWord.classList.add('guy-reader-word-active');
+        }
+      }
     }
   }
 
@@ -421,34 +621,85 @@
   // Remember a reading origin even before playback starts. Ordinary page links still work.
   function setupClickToSeek() {
     document.addEventListener('click', e => {
-      if (e.target.closest('#guy-reader-floating-pill, input, textarea, select, button, a, [contenteditable="true"]')) return;
+      if (e.target.closest('#guy-reader-floating-pill, #guy-reader-selection-btn, input, textarea, select, button, a, [contenteditable="true"]')) return;
       const caret = document.caretPositionFromPoint?.(e.clientX, e.clientY);
       const range = !caret && document.caretRangeFromPoint?.(e.clientX, e.clientY);
-      chrome.runtime.sendMessage({action:'reader-focus'}, () => { void chrome.runtime.lastError; });
-      state.lastPoint = {node: caret?.offsetNode || range?.startContainer,
-        offset: caret?.offset ?? range?.startOffset, x:e.clientX, y:e.clientY};
+      chrome.runtime.sendMessage({ action: 'reader-focus' }, () => { void chrome.runtime.lastError; });
+      state.lastPoint = {
+        node: caret?.offsetNode || range?.startContainer,
+        offset: caret?.offset ?? range?.startOffset, x: e.clientX, y: e.clientY
+      };
       if (!state.isActive) return;
       const position = pointPosition(state.lastPoint);
       if (position) playSentence(position.index, false, position.offset);
     }, true);
   }
 
-  // 5. Speech Playback Core
-  function startReading(fromSelection = true) {
-    stopReading();
-    state.currentIndex = -1;
+  function extractClickedOrSelectedText() {
+    const selection = window.getSelection?.();
+    const selText = selection && !selection.isCollapsed ? selection.toString().trim() : '';
+    if (selText.length > 0) return selText;
+    if (state.lastSelection && (Date.now() - (state.lastSelection.time || 0) < 120000) && state.lastSelection.text) {
+      return state.lastSelection.text;
+    }
+
     state.sentences = extractArticleData();
+    if (!state.sentences || state.sentences.length === 0) return '';
+
+    let startIndex = 0, startOffset = 0;
+    const point = pointPosition(state.lastPoint);
+    if (point) {
+      startIndex = point.index;
+      startOffset = point.offset;
+    } else {
+      startIndex = getSelectionSentenceIndex(state.sentences);
+    }
+
+    const parts = [];
+    for (let i = startIndex; i < state.sentences.length; i++) {
+      const s = state.sentences[i]?.text || '';
+      if (!s) continue;
+      parts.push(i === startIndex && startOffset > 0 ? s.slice(startOffset).trim() : s);
+    }
+    return parts.filter(Boolean).join(' ').trim();
+  }
+
+  // 5. Speech Playback Core
+  function startReading(fromSelection = true, explicitText = null) {
+    getAudioContext();
+    if (!state.sharedAudio && typeof Audio !== 'undefined') {
+      state.sharedAudio = new Audio();
+    }
+    stopReading();
+    hideSelectionTooltip();
+    state.currentIndex = -1;
+
+    let selectedSentences = null;
+    if (fromSelection || (explicitText && explicitText.trim().length > 0)) {
+      selectedSentences = extractSelectionData(explicitText);
+    }
+
+    if (selectedSentences && selectedSentences.length > 0) {
+      state.sentences = selectedSentences;
+      state.isSelectionMode = true;
+    } else {
+      state.isSelectionMode = false;
+      state.sentences = extractArticleData();
+    }
+
     if (state.sentences.length === 0) {
-      alert("Guy_reader: No readable article text found on this page.");
+      const isPdf = location.pathname.toLowerCase().endsWith('.pdf') || !!document.querySelector('embed[type*="pdf"]');
+      if (isPdf) {
+        alert("Guy Reader: בקובצי PDF בדפדפן, סמן את הטקסט שברצונך לשמוע, לחץ עליו עם המקש הימני בעכבר (קליק ימני) ובחר: '🔊 הקרא עם Guy Reader'.");
+      } else {
+        alert("Guy_reader: לא נמצא מלל לקריאה בעמוד זה.");
+      }
       return;
     }
 
     let startIndex = 0, startOffset = 0;
-    if (fromSelection) {
-      const selection = window.getSelection?.();
-      const selected = selection && !selection.isCollapsed
-        ? pointPosition({node:selection.anchorNode, offset:selection.anchorOffset}) : null;
-      const point = selected || pointPosition(state.lastPoint);
+    if (!state.isSelectionMode && fromSelection) {
+      const point = pointPosition(state.lastPoint);
       if (point) { startIndex = point.index; startOffset = point.offset; }
       else startIndex = getSelectionSentenceIndex(state.sentences);
     }
@@ -459,7 +710,7 @@
     if (he && !state.voice.includes('he-')) {
       state.voice = 'edge-he-avri';
     } else if (!he && state.voice.includes('he-')) {
-      state.voice = 'af_sarah';
+      state.voice = 'edge-en-jenny';
     }
     // Edge neural voices have a fixed identity but no word-boundary metadata.
     // Never replace a chosen Avri/Hila voice just to provide exact highlighting.
@@ -474,6 +725,107 @@
     showFloatingPill();
     updatePillUI();
     playSentence(startIndex, false, startOffset);
+  }
+
+  // Quick-read floating button on selection
+  let selectionTooltipEl = null;
+
+  function hideSelectionTooltip() {
+    if (selectionTooltipEl) {
+      selectionTooltipEl.style.display = 'none';
+    }
+  }
+
+  function showSelectionTooltip(rect, fallbackX = null, fallbackY = null) {
+    let top = 20, left = 20;
+    if (rect && (rect.width > 0 || rect.height > 0)) {
+      top = Math.max(8, rect.top > 44 ? rect.top - 40 : rect.bottom + 8);
+      left = Math.max(10, Math.min(window.innerWidth - 120, rect.left + (rect.width / 2) - 48));
+    } else if (typeof fallbackX === 'number' && typeof fallbackY === 'number') {
+      top = Math.max(8, fallbackY - 42);
+      left = Math.max(10, Math.min(window.innerWidth - 120, fallbackX - 48));
+    } else {
+      return;
+    }
+
+    if (!selectionTooltipEl) {
+      selectionTooltipEl = document.createElement('div');
+      selectionTooltipEl.id = 'guy-reader-selection-btn';
+      selectionTooltipEl.innerHTML = `<span style="display:flex;align-items:center;gap:4px;">🔊 קרא מסומן</span>`;
+      selectionTooltipEl.title = 'קרא מלל מסומן עם Guy Reader';
+      selectionTooltipEl.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      });
+      selectionTooltipEl.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        hideSelectionTooltip();
+        startReading(true);
+      });
+      (document.body || document.documentElement).appendChild(selectionTooltipEl);
+    }
+
+    selectionTooltipEl.style.top = `${top}px`;
+    selectionTooltipEl.style.left = `${left}px`;
+    selectionTooltipEl.style.display = 'flex';
+  }
+
+  function updateLastSelection() {
+    try {
+      const sel = window.getSelection ? window.getSelection() : null;
+      if (!sel || sel.isCollapsed || !sel.rangeCount) return;
+      const text = sel.toString().trim();
+      if (text.length > 0) {
+        state.lastSelection = {
+          text,
+          range: sel.getRangeAt(0).cloneRange(),
+          time: Date.now()
+        };
+      }
+    } catch (_) {}
+  }
+
+  function setupSelectionHandlers() {
+    let tooltipDebounce = null;
+    document.addEventListener('selectionchange', () => {
+      updateLastSelection();
+      if (tooltipDebounce) clearTimeout(tooltipDebounce);
+      tooltipDebounce = setTimeout(() => {
+        const sel = window.getSelection ? window.getSelection() : null;
+        if (sel && !sel.isCollapsed && sel.toString().trim().length >= 2) {
+          try {
+            const rect = sel.getRangeAt(0).getBoundingClientRect();
+            showSelectionTooltip(rect);
+          } catch (_) {}
+        }
+      }, 180);
+    }, { passive: true });
+
+    document.addEventListener('mouseup', (e) => {
+      updateLastSelection();
+      if (e.target.closest?.('#guy-reader-floating-pill, #guy-reader-selection-btn, input, textarea')) return;
+      const cx = e.clientX, cy = e.clientY;
+      setTimeout(() => {
+        const sel = window.getSelection ? window.getSelection() : null;
+        if (sel && !sel.isCollapsed && sel.toString().trim().length >= 2) {
+          try {
+            const rect = sel.getRangeAt(0).getBoundingClientRect();
+            showSelectionTooltip(rect, cx, cy);
+          } catch (_) {
+            showSelectionTooltip(null, cx, cy);
+          }
+        } else {
+          hideSelectionTooltip();
+        }
+      }, 30);
+    }, { passive: true });
+
+    document.addEventListener('mousedown', (e) => {
+      if (!e.target.closest?.('#guy-reader-selection-btn')) {
+        hideSelectionTooltip();
+      }
+    }, { passive: true });
   }
 
   function stopReading() {
@@ -542,6 +894,7 @@
     }
 
     if (!continuous) { state.generation++; state.prefetch.clear(); }
+    const currentGen = state.generation;
     const mySeq = ++state.sequenceId;
     stopCurrentAudioOnly();
     state.currentIndex = index;
@@ -554,109 +907,131 @@
     state.wordOffset = offset;
     const textToSpeak = sentenceItem.text.slice(offset);
     const hebrewVoice = /he-|avri|hila|roboshaul|shaul/i.test(state.voice);
-    const voice = isHebrew(textToSpeak)
+    const elevenVoice = state.voice && state.voice.startsWith('eleven-');
+    const voice = elevenVoice ? state.voice : (isHebrew(textToSpeak)
       ? (hebrewVoice ? state.voice : 'edge-he-avri')
-      : (hebrewVoice ? 'af_sarah' : state.voice);
+      : (hebrewVoice ? 'edge-en-jenny' : state.voice));
 
     highlightSentenceOnPage(index);
-    if (state.synchronized && !isHebrew(textToSpeak) && !voice.startsWith('edge-')) {
+    if (state.synchronized && !isHebrew(textToSpeak) && !voice.startsWith('edge-') && !elevenVoice) {
       speakConnectedPassage(index, offset, mySeq);
       return;
     }
 
-    // Try local speech engine first (proxied via background.js to bypass webpage CSP)
-    if (state.engineAvailable && !voice.startsWith('edge-')) {
-      const localAudioDataUrl = await prefetchSentence(index, offset);
-
-      if (state.sequenceId !== mySeq) return; // Stale
-
-      if (localAudioDataUrl) {
-        playAudioUrl(localAudioDataUrl, textToSpeak, mySeq, true, offset);
-        prefetchSentence(index + 1);
-        prefetchSentence(index + 2);
+    // Try ElevenLabs synthesis if selected
+    if (voice.startsWith('eleven-')) {
+      if (!state.elevenApiKey) {
+        const key = prompt('Please enter your free ElevenLabs API Key (from elevenlabs.io):');
+        if (key && key.trim()) {
+          state.elevenApiKey = key.trim();
+          chrome.storage?.local.set({ guy_reader_eleven_key: state.elevenApiKey });
+        }
+      }
+      if (state.elevenApiKey) {
+        chrome.runtime.sendMessage({
+          action: 'synthesize-elevenlabs',
+          text: textToSpeak,
+          voice: voice,
+          key: state.elevenApiKey
+        }, (resp) => {
+          if (state.sequenceId !== mySeq) return;
+          if (resp && resp.success && resp.audioDataUrl) {
+            playAudioUrl(resp.audioDataUrl, textToSpeak, mySeq, false, offset);
+          } else {
+            console.warn('[GuyReader] ElevenLabs synthesis failed, falling back:', resp?.error);
+            const fb = isHebrew(textToSpeak) ? 'edge-he-avri' : 'edge-en-jenny';
+            chrome.runtime.sendMessage({
+              action: 'synthesize-edge-tts',
+              text: textToSpeak,
+              voice: fb,
+              rate: 1.0
+            }, (edgeResp) => {
+              if (state.sequenceId !== mySeq) return;
+              if (edgeResp && edgeResp.success && edgeResp.audioDataUrl) {
+                playAudioUrl(edgeResp.audioDataUrl, textToSpeak, mySeq, false, offset);
+              } else {
+                speakWebSpeech(textToSpeak, mySeq, offset);
+              }
+            });
+          }
+        });
         return;
       }
     }
 
-    // Direct local synthesis if voice is local (e.g. he-roboshaul or kokoro)
-    if (state.engineAvailable && (!voice.startsWith('edge-') || voice.includes('roboshaul'))) {
-      chrome.runtime.sendMessage({
-        action: 'synthesize-local',
-        text: textToSpeak,
-        voice,
-        speed: 1.0
-      }, (localResp) => {
-        if (state.sequenceId !== mySeq) return;
-        if (localResp && localResp.success && localResp.audioDataUrl) {
-          playAudioUrl(localResp.audioDataUrl, textToSpeak, mySeq, true, offset);
+    // 1. Fetch current sentence immediately and start prefetching next sentence right behind it
+    const currentAudioPromise = prefetchSentence(index, offset);
+    if (index + 1 < state.sentences.length) {
+      setTimeout(() => {
+        if (state.isActive && state.generation === currentGen) {
           prefetchSentence(index + 1);
-          prefetchSentence(index + 2);
-        } else if (isHebrew(textToSpeak)) {
-          // Fallback to Edge Avri if local Hebrew engine fails
-          chrome.runtime.sendMessage({
-            action: 'synthesize-edge-tts',
-            text: textToSpeak,
-            voice: 'edge-he-avri',
-            rate: 1.0
-          }, (edgeResp) => {
-            if (state.sequenceId !== mySeq) return;
-            if (edgeResp && edgeResp.success && edgeResp.audioDataUrl) {
-              playAudioUrl(edgeResp.audioDataUrl, textToSpeak, mySeq, false, offset);
-            } else {
-              console.warn('[GuyReader] Hebrew neural voice failed. Carmit fallback blocked.');
-              onSentenceFinished();
-            }
-          });
-        } else {
-          speakWebSpeech(textToSpeak, mySeq, offset);
         }
-      });
+      }, 60);
+    }
+    const audioDataUrl = await currentAudioPromise;
+    if (state.sequenceId !== mySeq) return; // Stale or canceled
+
+    if (audioDataUrl) {
+      prefetchSentence(index + 1);
+      playAudioUrl(audioDataUrl, textToSpeak, mySeq, true, offset);
       return;
     }
 
-    // Fallback: Edge TTS via background.js
-    if (voice.startsWith('edge-') || isHebrew(textToSpeak)) {
-      const edgeVoice = isHebrew(textToSpeak) ? (voice.startsWith('edge-') ? voice : 'edge-he-avri') : (voice.startsWith('edge-') ? voice : 'edge-en-jenny');
-      chrome.runtime.sendMessage({
-        action: 'synthesize-edge-tts',
-        text: textToSpeak,
-        voice: edgeVoice,
-        rate: 1.0
-      }, (resp) => {
-        if (state.sequenceId !== mySeq) return;
-        if (resp && resp.success && resp.audioDataUrl) {
-          playAudioUrl(resp.audioDataUrl, textToSpeak, mySeq, false, offset);
-          prefetchSentence(index + 1);
-        } else if (state.engineAvailable) {
+    // 2. Fallback direct synthesis with the exact same chosen voice (never switch voice mid-reading)
+    const action = voice.startsWith('edge-') ? 'synthesize-edge-tts' : 'synthesize-local';
+    chrome.runtime.sendMessage({
+      action,
+      text: textToSpeak,
+      voice,
+      speed: 1.0,
+      rate: 1.0
+    }, (resp) => {
+      if (state.sequenceId !== mySeq) return;
+      if (resp && resp.success && resp.audioDataUrl) {
+        prefetchSentence(index + 1);
+        playAudioUrl(resp.audioDataUrl, textToSpeak, mySeq, false, offset);
+      } else {
+        // Retry once with the SAME voice after a short pause (never switch to another voice or robotic WebSpeech)
+        setTimeout(() => {
+          if (state.sequenceId !== mySeq) return;
           chrome.runtime.sendMessage({
-            action: 'synthesize-local',
+            action,
             text: textToSpeak,
             voice,
-            speed: 1.0
-          }, (localResp) => {
+            speed: 1.0,
+            rate: 1.0
+          }, (retryResp) => {
             if (state.sequenceId !== mySeq) return;
-            if (localResp && localResp.success && localResp.audioDataUrl) {
-              playAudioUrl(localResp.audioDataUrl, textToSpeak, mySeq, true, offset);
-            } else if (!isHebrew(textToSpeak)) {
-              speakWebSpeech(textToSpeak, mySeq, offset);
+            if (retryResp && retryResp.success && retryResp.audioDataUrl) {
+              prefetchSentence(index + 1);
+              playAudioUrl(retryResp.audioDataUrl, textToSpeak, mySeq, false, offset);
             } else {
-              console.warn('[GuyReader] Hebrew neural voice failed. Carmit fallback blocked.');
-              onSentenceFinished();
+              stopReading();
+              showToastNotice('⚠️ שרת הקול ברקע לא הגיב. ודא ש-Launch_Guy_Reader.bat פועל.');
             }
           });
-        } else if (!isHebrew(textToSpeak)) {
-          speakWebSpeech(textToSpeak, mySeq, offset);
-        } else {
-          console.warn('[GuyReader] Hebrew neural voice failed. Carmit fallback blocked.');
-          onSentenceFinished();
-        }
-      });
-    } else if (!isHebrew(textToSpeak)) {
-      speakWebSpeech(textToSpeak, mySeq, offset);
-    } else {
-      console.warn('[GuyReader] Hebrew neural voice failed. Carmit fallback blocked.');
-      onSentenceFinished();
-    }
+        }, 350);
+      }
+    });
+  }
+
+  function showToastNotice(text) {
+    try {
+      let toast = document.getElementById('guy-reader-toast');
+      if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'guy-reader-toast';
+        toast.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#18181b;color:#f43f5e;border:1px solid #e11d48;padding:12px 20px;border-radius:10px;font-family:system-ui,-apple-system,sans-serif;font-size:14px;font-weight:500;z-index:9999999;box-shadow:0 10px 25px rgba(0,0,0,0.5);direction:rtl;text-align:center;transition:opacity 0.3s;pointer-events:none;';
+        document.body.appendChild(toast);
+      }
+      toast.textContent = text;
+      toast.style.opacity = '1';
+      toast.style.display = 'block';
+      setTimeout(() => {
+        toast.style.opacity = '0';
+        setTimeout(() => { toast.style.display = 'none'; }, 300);
+      }, 5000);
+    } catch (_) {}
   }
 
   function speakConnectedPassage(index, offset, sequence) {
@@ -676,29 +1051,43 @@
 
   function prefetchSentence(index, offset = 0) {
     const item = state.sentences[index];
-    if (!item || !state.engineAvailable) return Promise.resolve(null);
+    if (!item) return Promise.resolve(null);
     const isHeb = /he-|avri|hila|roboshaul|shaul/i.test(state.voice);
     const voice = isHebrew(item.text)
       ? (isHeb ? state.voice : 'edge-he-avri')
-      : (isHeb ? 'af_sarah' : state.voice);
+      : (isHeb ? 'edge-en-jenny' : state.voice);
+    if (voice.startsWith('eleven-')) return Promise.resolve(null);
     const key = `${index}:${offset}:${voice}`;
     if (state.prefetch.has(key)) return state.prefetch.get(key);
     const generation = state.generation;
     const request = new Promise(resolve => {
       try {
         const action = voice.startsWith('edge-') ? 'synthesize-edge-tts' : 'synthesize-local';
-        chrome.runtime.sendMessage({action,text:item.text.slice(offset),voice,speed:1.0,rate:1.0}, resp => {
+        chrome.runtime.sendMessage({
+          action,
+          text: item.text.slice(offset),
+          voice,
+          speed: 1.0,
+          rate: 1.0
+        }, resp => {
           const audioUrl = (generation === state.generation && !chrome.runtime.lastError && resp?.success) ? resp.audioDataUrl : null;
           resolve(audioUrl);
-          if (audioUrl && index + 1 < state.sentences.length) {
+          if (audioUrl && index + 1 < state.sentences.length && (state.currentIndex < 0 || index + 1 <= state.currentIndex + 3)) {
             prefetchSentence(index + 1);
           }
         });
       } catch (_) { resolve(null); }
     });
     state.prefetch.set(key, request);
-    // Keep only a short window instead of retaining an entire article's audio.
-    for (const old of state.prefetch.keys()) if (Number(old.split(':')[0]) < index - 1) state.prefetch.delete(old);
+    request.then(url => {
+      if (!url && state.prefetch.get(key) === request) {
+        state.prefetch.delete(key);
+      }
+    });
+    // Keep a sliding window of prefetch
+    for (const old of state.prefetch.keys()) {
+      if (Number(old.split(':')[0]) < index - 1) state.prefetch.delete(old);
+    }
     return request;
   }
 
@@ -734,17 +1123,17 @@
 
   function stopCurrentAudioOnly() {
     if (state.activeSourceNode) {
-      try { state.activeSourceNode.stop(); } catch (_) {}
+      try {
+        state.activeSourceNode.onended = null;
+        state.activeSourceNode.stop();
+      } catch (_) {}
       state.activeSourceNode = null;
     }
     if (state.audioElement) {
       state.audioElement.onplay = null;
       state.audioElement.onended = null;
       state.audioElement.onerror = null;
-      state.audioElement.pause();
-      state.audioElement.removeAttribute('src');
-      state.audioElement.load();
-      state.audioElement = null;
+      try { state.audioElement.pause(); } catch (_) {}
     }
     if (state.currentSpeechUtterance) {
       state.currentSpeechUtterance.onend = null;
@@ -789,7 +1178,12 @@
       try {
         const ctx = getAudioContext();
         if (!ctx) return false;
-        if (ctx.state === 'suspended') await ctx.resume();
+        if (ctx.state === 'suspended') {
+          await Promise.race([
+            ctx.resume().catch(() => {}),
+            new Promise(r => setTimeout(r, 350))
+          ]);
+        }
         let arrayBuf = null;
         if (rawBlob && rawBlob.arrayBuffer) {
           arrayBuf = await rawBlob.arrayBuffer();
@@ -805,6 +1199,7 @@
         if (!arrayBuf) return false;
 
         const audioBuffer = await ctx.decodeAudioData(arrayBuf);
+        if (state.sequenceId !== seqId) return true;
         const source = ctx.createBufferSource();
         source.buffer = audioBuffer;
         source.playbackRate.value = state.speed;
@@ -815,9 +1210,15 @@
           if (state.wordTimer) clearInterval(state.wordTimer);
           onSentenceFinished();
         };
+        const startedAt = ctx.currentTime;
         source.start(0);
         state.activeSourceNode = source;
-        startWordTimer(text, { currentTime: 0, duration: audioBuffer.duration }, offset);
+        startWordTimer(text, {
+          get currentTime() {
+            return Math.max(0, (ctx.currentTime - startedAt) * (state.speed || 1.0));
+          },
+          duration: audioBuffer.duration
+        }, offset);
         updatePillUI();
         return true;
       } catch (err) {
@@ -826,9 +1227,21 @@
       }
     };
 
-    const audio = new Audio(playableUrl);
+    if (!state.sharedAudio && typeof Audio !== 'undefined') {
+      state.sharedAudio = new Audio();
+    }
+    const audio = state.sharedAudio || new Audio();
     state.audioElement = audio;
+    audio.onplay = null;
+    audio.onended = null;
+    audio.onerror = null;
+    audio.src = playableUrl;
+    audio.defaultPlaybackRate = state.speed;
     audio.playbackRate = state.speed;
+    audio.onloadedmetadata = () => {
+      audio.defaultPlaybackRate = state.speed;
+      audio.playbackRate = state.speed;
+    };
 
     audio.onplay = () => {
       if (state.sequenceId !== seqId || state.isPaused) {
@@ -836,6 +1249,8 @@
         cleanup();
         return;
       }
+      audio.defaultPlaybackRate = state.speed;
+      audio.playbackRate = state.speed;
       startWordTimer(text, audio, offset);
       updatePillUI();
     };
@@ -854,12 +1269,8 @@
 
       cleanup();
       if (state.sequenceId !== seqId) return;
-      if (isHebrew(text)) {
-        console.warn('[GuyReader] Hebrew audio error; Carmit fallback blocked.');
-        onSentenceFinished();
-        return;
-      }
-      speakWebSpeech(text, seqId, offset);
+      console.warn('[GuyReader] Audio playback error, advancing to next sentence.');
+      onSentenceFinished();
     };
 
     const playPromise = state.isPaused ? undefined : audio.play();
@@ -955,7 +1366,10 @@
     if (state.currentIndex + 1 < state.sentences.length) {
       const nextIndex = state.currentIndex + 1;
       const seqId = state.sequenceId;
-      const pauseMs = Math.max(80, Math.round(220 / (state.speed || 1.0)));
+      const finishedText = (state.sentences[state.currentIndex]?.text || '').trim();
+      const isBulletOrHeadingClause = finishedText.length > 0 && !/[.!?…׃'"”’)\]}]$/u.test(finishedText);
+      const basePauseMs = isBulletOrHeadingClause ? 190 : 30;
+      const pauseMs = Math.max(15, Math.round(basePauseMs / Math.max(0.6, state.speed || 1.0)));
       if (typeof setTimeout !== 'undefined') {
         if (typeof clearTimeout !== 'undefined' && state.sentenceTransitionTimer) {
           clearTimeout(state.sentenceTransitionTimer);
@@ -996,22 +1410,56 @@
       <span class="guy-reader-counter" id="guy-counter">[0/0]</span>
       <div class="guy-reader-speed-group">
         <button class="guy-reader-speed-btn" id="guy-speed-down">−</button>
-        <span class="guy-reader-speed-val" id="guy-speed-val">1.0x</span>
+        <span class="guy-reader-speed-val" id="guy-speed-val">${state.speed.toFixed(1)}x</span>
         <button class="guy-reader-speed-btn" id="guy-speed-up">+</button>
       </div>
-      <select class="guy-reader-voice-select" id="guy-mode-select" title="Word highlighting mode">
+      <select class="guy-reader-voice-select" id="guy-mode-select" title="Word highlighting mode" style="display:none;">
         <option value="sync">Follow words · Evan (English)</option>
         <option value="neural">Neural · estimated words</option>
       </select>
       <select class="guy-reader-voice-select" id="guy-voice-select" title="Voice">
-        <optgroup label="English (Local Kokoro)">
-          <option value="af_sarah">🎙️ Sarah</option>
-          <option value="am_michael">🎙️ Michael</option>
+        <optgroup label="OpenAI / Codex-Style &amp; Kokoro Neural (Local)">
+          <option value="af_heart">🧠 Heart (Expressive)</option>
+          <option value="af_nova">🧠 Nova (OpenAI-Style)</option>
+          <option value="af_alloy">🧠 Alloy (OpenAI-Style)</option>
+          <option value="af_sky">🧠 Sky (OpenAI-Style)</option>
+          <option value="af_bella">🧠 Bella</option>
+          <option value="af_sarah">🧠 Sarah</option>
+          <option value="am_onyx">🧠 Onyx (OpenAI-Style)</option>
+          <option value="am_echo">🧠 Echo (OpenAI-Style)</option>
+          <option value="am_puck">🧠 Puck</option>
+          <option value="am_fenrir">🧠 Fenrir</option>
+          <option value="am_adam">🧠 Adam</option>
+          <option value="am_liam">🧠 Liam</option>
+          <option value="am_michael">🧠 Michael</option>
+          <option value="bm_fable">🧠 Fable (British)</option>
+          <option value="bm_george">🧠 George (British)</option>
+          <option value="bf_emma">🧠 Emma (British)</option>
         </optgroup>
-        <optgroup label="Hebrew Voices">
-          <option value="he-roboshaul">🎙️ Shaul (RoboShaul)</option>
-          <option value="edge-he-avri">🌟 Avri</option>
-          <option value="edge-he-hila">🌟 Hila</option>
+        <optgroup label="Hebrew Neural Voices">
+          <option value="edge-he-avri">🌟 Avri (Hebrew Male)</option>
+          <option value="edge-he-hila">🌟 Hila (Hebrew Female)</option>
+          <option value="edge-he-andrew">🌟 Andrew (HE/EN Male)</option>
+          <option value="edge-he-ava">🌟 Ava (HE/EN Female)</option>
+          <option value="edge-he-brian">🌟 Brian (HE/EN Male)</option>
+          <option value="edge-he-emma">🌟 Emma (HE/EN Female)</option>
+        </optgroup>
+        <optgroup label="English Edge Neural">
+          <option value="edge-en-ava">🌟 Ava (US Female)</option>
+          <option value="edge-en-andrew">🌟 Andrew (US Male)</option>
+          <option value="edge-en-brian">🌟 Brian (US Male)</option>
+          <option value="edge-en-emma">🌟 Emma (US Female)</option>
+          <option value="edge-en-aria">🌟 Aria (US Female)</option>
+          <option value="edge-en-christopher">🌟 Christopher (US Male)</option>
+          <option value="edge-en-jenny">🌟 Jenny (US Female)</option>
+          <option value="edge-en-guy">🌟 Guy (US Male)</option>
+          <option value="edge-en-sonia">🌟 Sonia (UK Female)</option>
+          <option value="edge-en-ryan">🌟 Ryan (UK Male)</option>
+        </optgroup>
+        <optgroup label="ElevenLabs Multilingual v2">
+          <option value="eleven-rachel">💎 Rachel (ElevenLabs)</option>
+          <option value="eleven-adam">💎 Adam (ElevenLabs)</option>
+          <option value="eleven-charlie">💎 Charlie (ElevenLabs)</option>
         </optgroup>
       </select>
       <span class="guy-reader-clean-btn" id="guy-btn-clean" title="Toggle Clean Reader Mode">📖</span>
@@ -1030,7 +1478,7 @@
     mode.value = state.synchronized ? 'sync' : 'neural';
     mode.addEventListener('change', e => {
       state.synchronized = e.target.value === 'sync';
-      chrome.storage?.local.set({guy_reader_sync:state.synchronized});
+      chrome.storage?.local.set({ guy_reader_sync: state.synchronized });
       if (state.isPlaying || state.isPaused) playSentence(Math.max(0, state.currentIndex), false, state.wordOffset);
     });
     document.getElementById('guy-btn-play').addEventListener('click', () => {
@@ -1048,12 +1496,24 @@
     });
 
     document.getElementById('guy-voice-select').addEventListener('change', (e) => {
-      state.voice = e.target.value;
-      chrome.storage?.local.set({guy_reader_voice:state.voice});
-      if (state.voice.startsWith('edge-') && state.synchronized) {
+      const selected = e.target.value;
+      if (selected.startsWith('eleven-') && !state.elevenApiKey) {
+        const key = prompt('Enter your free ElevenLabs API Key (from elevenlabs.io):');
+        if (key && key.trim()) {
+          state.elevenApiKey = key.trim();
+          chrome.storage?.local.set({ guy_reader_eleven_key: state.elevenApiKey });
+        } else {
+          alert('ElevenLabs requires an API key. Reverting to previous voice.');
+          e.target.value = state.voice || 'edge-he-avri';
+          return;
+        }
+      }
+      state.voice = selected;
+      chrome.storage?.local.set({ guy_reader_voice: state.voice });
+      if ((state.voice.startsWith('edge-') || state.voice.startsWith('eleven-')) && state.synchronized) {
         state.synchronized = false;
         mode.value = 'neural';
-        chrome.storage?.local.set({guy_reader_sync:false});
+        chrome.storage?.local.set({ guy_reader_sync: false });
       }
       if (state.isPlaying || state.isPaused) {
         playSentence(state.currentIndex >= 0 ? state.currentIndex : 0);
@@ -1073,9 +1533,14 @@
   }
 
   function setSpeed(newSpeed) {
-    state.speed = newSpeed;
+    state.speed = Math.max(0.5, Math.min(2.5, Math.round(newSpeed * 10) / 10));
+    chrome.storage?.local?.set({ guy_reader_speed: state.speed });
     if (state.audioElement) {
+      state.audioElement.defaultPlaybackRate = state.speed;
       state.audioElement.playbackRate = state.speed;
+    }
+    if (state.activeSourceNode && state.activeSourceNode.playbackRate) {
+      state.activeSourceNode.playbackRate.value = state.speed;
     }
     const valEl = document.getElementById('guy-speed-val');
     if (valEl) valEl.textContent = state.speed.toFixed(1) + 'x';
@@ -1164,43 +1629,88 @@
     }
   }
 
+  function escapeCleanHtml(str) {
+    return (str || '').replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+
+  function renderCleanSentenceHtml(text, sentenceIndex) {
+    let html = `<span class="guy-clean-sentence" data-guy-sentence="${sentenceIndex}">`;
+    const tokens = [...(text || '').matchAll(/\S+|\s+/gu)];
+    for (const tok of tokens) {
+      if (/^\s+$/u.test(tok[0])) {
+        html += tok[0];
+      } else {
+        html += `<span class="guy-clean-word" data-guy-word="${tok.index}">${escapeCleanHtml(tok[0])}</span>`;
+      }
+    }
+    html += `</span>`;
+    return html;
+  }
+
   function enterCleanReaderMode() {
     if (state.cleanReaderMode) return;
 
-    // Collect article text from sentences
-    const textParagraphs = [];
+    if (!state.sentences || state.sentences.length === 0) {
+      state.sentences = extractSelectionData() || extractArticleData();
+    }
+
+    // Group sentences into paragraphs while preserving exact global sentence indices
+    const paragraphs = [];
     let lastEl = null;
-    for (const item of state.sentences) {
-      if (item.element !== lastEl) {
-        textParagraphs.push([]);
+    for (let i = 0; i < state.sentences.length; i++) {
+      const item = state.sentences[i];
+      if (paragraphs.length === 0 || (item.element && item.element !== lastEl)) {
+        paragraphs.push([]);
         lastEl = item.element;
       }
-      textParagraphs[textParagraphs.length - 1].push(item.text);
+      paragraphs[paragraphs.length - 1].push({ index: i, text: item.text });
     }
 
     // Create overlay
     const overlay = document.createElement('div');
     overlay.id = 'guy-reader-clean-overlay';
+    const titleDir = isHebrew(document.title || '') ? 'rtl' : 'ltr';
     overlay.innerHTML = `
       <div class="guy-reader-clean-content">
-        <h1 class="guy-reader-clean-title">${document.title || 'Article'}</h1>
-        ${textParagraphs.map(para =>
-          `<p class="guy-reader-clean-para">${para.join(' ')}</p>`
-        ).join('\n')}
+        <h1 class="guy-reader-clean-title" dir="${titleDir}">${escapeCleanHtml(document.title || 'Article')}</h1>
+        ${paragraphs.map(para => {
+          const paraText = para.map(p => p.text).join(' ');
+          const dir = isHebrew(paraText) ? 'rtl' : 'ltr';
+          return `<p class="guy-reader-clean-para" dir="${dir}">${para.map(p => renderCleanSentenceHtml(p.text, p.index)).join(' ')}</p>`;
+        }).join('\n')}
       </div>
     `;
+
+    // Click any word or sentence in Clean Reader Mode to jump right to it
+    overlay.addEventListener('click', (e) => {
+      const wordEl = e.target.closest?.('[data-guy-word]');
+      const sentEl = e.target.closest?.('[data-guy-sentence]');
+      if (!sentEl) return;
+      const sIdx = Number(sentEl.getAttribute('data-guy-sentence'));
+      const wOffset = wordEl ? Number(wordEl.getAttribute('data-guy-word')) : 0;
+      if (Number.isFinite(sIdx) && sIdx >= 0 && sIdx < state.sentences.length) {
+        e.stopPropagation();
+        playSentence(sIdx, false, Number.isFinite(wOffset) ? wOffset : 0);
+      }
+    });
 
     document.body.appendChild(overlay);
     state.cleanReaderMode = true;
 
     // Update button state
     const btn = document.getElementById('guy-btn-clean');
-    if (btn) btn.title = 'Exit Clean Reader Mode';
+    if (btn) {
+      btn.title = 'Exit Clean Reader Mode';
+      btn.classList.add('guy-clean-active');
+    }
 
-    // Re-extract sentences from clean overlay so highlighting works
-    state.sentences = extractArticleData();
-    if (state.isPlaying && state.currentIndex >= 0) {
+    if (state.currentIndex >= 0) {
       highlightSentenceOnPage(state.currentIndex);
+      if (state.wordOffset >= 0) {
+        highlightWordAt(state.wordOffset);
+      }
     }
   }
 
@@ -1211,11 +1721,16 @@
     state.cleanReaderMode = false;
 
     const btn = document.getElementById('guy-btn-clean');
-    if (btn) btn.title = 'Toggle Clean Reader Mode';
+    if (btn) {
+      btn.title = 'Toggle Clean Reader Mode';
+      btn.classList.remove('guy-clean-active');
+    }
 
-    // Re-extract from original DOM
-    if (state.isActive) {
-      state.sentences = extractArticleData();
+    if (state.isActive && state.currentIndex >= 0) {
+      highlightSentenceOnPage(state.currentIndex);
+      if (state.wordOffset >= 0) {
+        highlightWordAt(state.wordOffset);
+      }
     }
   }
 
@@ -1254,8 +1769,11 @@
       startReading(false);
       sendResponse({ success: state.isPlaying });
     } else if (msg.action === 'read-from-selection') {
-      startReading(true);
+      startReading(true, msg.text);
       sendResponse({ success: state.isPlaying });
+    } else if (msg.action === 'extract-clicked-text') {
+      const text = extractClickedOrSelectedText();
+      sendResponse({ success: Boolean(text && text.length > 0), text: text || '' });
     } else if (msg.action === 'toggle-pill') {
       showFloatingPill();
       sendResponse({ success: true });
@@ -1265,6 +1783,7 @@
     }
   });
 
-  // Setup click to seek on start
+  // Setup click to seek and selection handlers on start
   setupClickToSeek();
+  setupSelectionHandlers();
 })();

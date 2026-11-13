@@ -5,6 +5,7 @@ Unified, local-first speech synthesis for English (Kokoro-82M) and Hebrew (Phoni
 
 from __future__ import annotations
 import os
+import sys
 import signal
 import threading
 import atexit
@@ -44,23 +45,18 @@ def remove_pid_file():
 
 atexit.register(remove_pid_file)
 
-# Kokoro ONNX import
-try:
-    from kokoro_onnx import Kokoro
-except ImportError:
-    Kokoro = None
+# Kokoro ONNX import (lazy-loaded on first English Kokoro synthesis for instant startup)
+Kokoro = None
+phonikud = None
 
-# Phonikud import
-try:
-    import phonikud
-except ImportError:
-    phonikud = None
-
-# Robo-Shaul Hebrew TTS import
-try:
-    from roboshaul import RoboShaulSynthesizer
-except ImportError:
+# Robo-Shaul Hebrew TTS import (disabled by default on Windows for fast, ultra-smooth performance)
+if os.environ.get("DISABLE_ROBOSHAUL", "1") == "1":
     RoboShaulSynthesizer = None
+else:
+    try:
+        from roboshaul import RoboShaulSynthesizer
+    except ImportError:
+        RoboShaulSynthesizer = None
 
 
 def detect_language(text: str) -> str:
@@ -117,6 +113,43 @@ def expand_hebrew_abbreviations(text: str) -> str:
         regex = rf'(^|[\s\(\"\'״׳])([בלמכושה]?[-]?){pattern}(?=[\s\(\"\'״׳\.,:;?!—–]|$)'
         expanded = re.sub(regex, replace_match, expanded)
     return expanded
+
+
+def prepare_text_for_tts(text: str, lang: str) -> str:
+    """Normalize punctuation, spaced dashes, bullets, and abbreviations for natural TTS prosody."""
+    if not text:
+        return text
+    import unicodedata
+    out = unicodedata.normalize("NFKC", text.strip())
+    if lang == "he":
+        out = expand_hebrew_abbreviations(out)
+    # Normalize spaced dashes (e.g. "צירי סחר - בארץ מדשדשים" or "word - word") into a comma pause
+    # so neural voices take a natural breath instead of rushing through hyphens.
+    out = re.sub(r"\s+[-–—]+\s+", ", ", out)
+    # Strip any residual bullet characters
+    out = re.sub(r"[•▪▫◆◇✦]+", ", ", out).strip(" ,")
+    # Ensure clause has terminal punctuation so bullet-split clauses get natural falling intonation
+    if out and not re.search(r"[.!?׃:;][\"'”’\)\]]*$", out):
+        out = out + "."
+    return out
+
+
+def trim_audio_bytes(audio_bytes: bytes, threshold: float = 0.012, pad_ms: int = 25) -> tuple[bytes, int, float] | None:
+    """Decode encoded audio (MP3/WAV), trim leading/trailing dead air, and return clean WAV bytes."""
+    try:
+        samples, sample_rate = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+        if samples.ndim > 1:
+            samples = np.mean(samples, axis=1)
+        if samples.size == 0:
+            return None
+        trimmed = trim_silence(np.asarray(samples, dtype=np.float32), sample_rate, threshold=threshold, pad_ms=pad_ms)
+        buf = io.BytesIO()
+        sf.write(buf, trimmed, sample_rate, format="WAV")
+        wav_bytes = buf.getvalue()
+        duration = float(len(trimmed)) / float(sample_rate)
+        return wav_bytes, sample_rate, duration
+    except Exception:
+        return None
 
 
 def split_sentences(raw_text: str) -> list[str]:
@@ -192,7 +225,7 @@ def split_sentences(raw_text: str) -> list[str]:
 
     # 9. Protect dialogue quotes ending in punctuation when followed by lowercase attribution
     text = re.sub(
-        r"([.!?׃]['\"”’\)\]]*)\s+([a-z])",
+        r"([.!?׃]['\"”’]+)\s+([a-z])",
         lambda m: m.group(1).replace(".", PLACEHOLDER) + " " + m.group(2),
         text,
     )
@@ -213,6 +246,73 @@ def split_sentences(raw_text: str) -> list[str]:
     return results
 
 
+def trim_silence(samples: np.ndarray, sample_rate: int, threshold: float = 0.01, pad_ms: int = 18) -> np.ndarray:
+    """Trim dead air from both ends using 10ms RMS energy windows and compress long internal pauses."""
+    if samples.size == 0:
+        return samples
+
+    win = max(1, int(0.010 * sample_rate))  # 10ms window
+    if len(samples) >= win * 2:
+        n_wins = len(samples) // win
+        framed = samples[: n_wins * win].reshape(n_wins, win)
+        rms = np.sqrt(np.mean(framed * framed, axis=1))
+        rms_thresh = max(0.006, threshold * 0.75)
+        active_wins = np.where(rms > rms_thresh)[0]
+        if active_wins.size > 0:
+            pad = int(pad_ms * sample_rate / 1000)
+            start = max(0, int(active_wins[0] * win) - pad)
+            end = min(len(samples), int((active_wins[-1] + 1) * win) + pad)
+            out = samples[start:end].copy()
+
+            # Compress any unnaturally long internal silent gaps (> 220ms) down to 130ms
+            n_out = len(out) // win
+            if n_out > 25:
+                out_rms = np.sqrt(np.mean(out[: n_out * win].reshape(n_out, win) ** 2, axis=1))
+                silent_mask = out_rms <= rms_thresh
+                max_gap_wins = 22  # 220ms
+                keep_gap_wins = 13  # 130ms
+                chunks = []
+                i = 0
+                while i < n_out:
+                    if not silent_mask[i]:
+                        j = i + 1
+                        while j < n_out and not silent_mask[j]:
+                            j += 1
+                        chunks.append(out[i * win : j * win])
+                        i = j
+                    else:
+                        j = i + 1
+                        while j < n_out and silent_mask[j]:
+                            j += 1
+                        gap_len = j - i
+                        if gap_len > max_gap_wins:
+                            chunks.append(out[i * win : (i + keep_gap_wins) * win])
+                        else:
+                            chunks.append(out[i * win : j * win])
+                        i = j
+                if n_out * win < len(out):
+                    chunks.append(out[n_out * win :])
+                if chunks:
+                    out = np.concatenate(chunks)
+
+            fade = min(int(0.008 * sample_rate), len(out))
+            if fade > 0:
+                out[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+            return out
+
+    above = np.where(np.abs(samples) > threshold)[0]
+    if above.size == 0:
+        return samples
+    pad = int(pad_ms * sample_rate / 1000)
+    start = max(0, above[0] - pad)
+    end = min(len(samples), above[-1] + pad)
+    out = samples[start:end].copy()
+    fade = min(int(0.008 * sample_rate), len(out))
+    if fade > 0:
+        out[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+    return out
+
+
 @dataclass
 class SynthesisResult:
     audio_bytes: bytes
@@ -225,6 +325,25 @@ class SynthesisResult:
 _shared_kokoro = None
 _shared_roboshaul = None
 _shared_engine_lock = threading.Lock()
+_kokoro_infer_lock = threading.Lock()
+_edge_semaphore = threading.Semaphore(4)
+_edge_loop: asyncio.AbstractEventLoop | None = None
+_edge_loop_lock = threading.Lock()
+
+
+def _get_edge_loop() -> asyncio.AbstractEventLoop:
+    global _edge_loop
+    with _edge_loop_lock:
+        if _edge_loop is None or _edge_loop.is_closed():
+            loop = asyncio.SelectorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
+            t = threading.Thread(target=loop.run_forever, daemon=True)
+            t.start()
+            _edge_loop = loop
+        return _edge_loop
+
+
+_global_synthesis_cache: dict[tuple[str, str, float], SynthesisResult] = {}
+_cache_lock = threading.Lock()
 
 
 class SpeechEngine:
@@ -239,27 +358,42 @@ class SpeechEngine:
         self.kokoro_model_path = self.models_dir / "kokoro-v1.0.onnx"
         self.kokoro_voices_path = self.models_dir / "voices-v1.0.bin"
         self._kokoro = None
-        self._init_kokoro()
         self._roboshaul = None
         self._roboshaul_cache = {}
+        self._edge_cache = {}
+        self._audio_cache = {}
         self._init_roboshaul()
 
+    @property
+    def is_kokoro_available(self) -> bool:
+        return self.kokoro_model_path.exists() and self.kokoro_voices_path.exists()
+
+    @property
+    def kokoro(self):
+        if self._kokoro is None and self.is_kokoro_available:
+            self._init_kokoro()
+        return self._kokoro
+
     def _init_kokoro(self):
-        global _shared_kokoro
-        if Kokoro and self.kokoro_model_path.exists() and self.kokoro_voices_path.exists():
-            with _shared_engine_lock:
-                if _shared_kokoro is not None:
-                    self._kokoro = _shared_kokoro
-                    return
-                try:
-                    self._kokoro = Kokoro(
-                        str(self.kokoro_model_path),
-                        str(self.kokoro_voices_path),
-                    )
-                    _shared_kokoro = self._kokoro
-                    self._warmup_background()
-                except Exception as e:
-                    print(f"[SpeechEngine] Error initializing Kokoro: {e}")
+        global _shared_kokoro, Kokoro
+        if not self.is_kokoro_available:
+            return
+        with _shared_engine_lock:
+            if _shared_kokoro is not None:
+                self._kokoro = _shared_kokoro
+                return
+            try:
+                if Kokoro is None:
+                    from kokoro_onnx import Kokoro as _Kokoro
+                    Kokoro = _Kokoro
+                self._kokoro = Kokoro(
+                    str(self.kokoro_model_path),
+                    str(self.kokoro_voices_path),
+                )
+                _shared_kokoro = self._kokoro
+                print("[SpeechEngine] Kokoro-82M ONNX model initialized on demand.")
+            except Exception as e:
+                print(f"[SpeechEngine] Error initializing Kokoro: {e}")
 
     def _init_roboshaul(self):
         global _shared_roboshaul
@@ -273,23 +407,9 @@ class SpeechEngine:
                     if synth.is_available():
                         self._roboshaul = synth
                         _shared_roboshaul = synth
-                        print("[SpeechEngine] Robo-Shaul synthesizer detected and ready.")
-                        threading.Thread(target=synth.load_models, daemon=True).start()
+                        print("[SpeechEngine] Robo-Shaul synthesizer detected (lazy-load on demand).")
                 except Exception as e:
                     print(f"[SpeechEngine] Notice initializing Robo-Shaul: {e}")
-
-    def _warmup_background(self):
-        """Warm up ONNX model execution graphs in background to eliminate cold start latency on M4."""
-        import threading
-        def _warmup():
-            try:
-                if self._kokoro:
-                    self._kokoro.create("Warmup.", voice="af_sarah", speed=1.0, lang="en-us")
-                    print("[SpeechEngine] Kokoro-82M ONNX model warmed up successfully.")
-            except Exception as e:
-                print(f"[SpeechEngine] Warmup notice: {e}")
-
-        threading.Thread(target=_warmup, daemon=True).start()
 
     def synthesize_sentence(
         self,
@@ -297,9 +417,29 @@ class SpeechEngine:
         voice: str | None = None,
         speed: float = 1.0,
     ) -> SynthesisResult:
-        """Synthesize a single sentence to audio."""
-        lang = detect_language(text)
+        """Synthesize a single sentence to audio with memory caching."""
+        cache_key = (text.strip(), voice or "", round(float(speed), 2))
+        with _cache_lock:
+            if cache_key in _global_synthesis_cache:
+                return _global_synthesis_cache[cache_key]
 
+        lang = detect_language(text)
+        res = self._synthesize_sentence_uncached(text, voice, speed, lang)
+
+        with _cache_lock:
+            if len(_global_synthesis_cache) > 256:
+                _global_synthesis_cache.pop(next(iter(_global_synthesis_cache)))
+            _global_synthesis_cache[cache_key] = res
+
+        return res
+
+    def _synthesize_sentence_uncached(
+        self,
+        text: str,
+        voice: str | None,
+        speed: float,
+        lang: str,
+    ) -> SynthesisResult:
         # Robo-Shaul Hebrew voice
         if voice in ("he-roboshaul", "roboshaul") or (lang == "he" and voice and "shaul" in voice.lower()):
             if self._roboshaul:
@@ -308,37 +448,50 @@ class SpeechEngine:
                 except Exception as e:
                     print(f"[SpeechEngine] Robo-Shaul synthesis error, falling back to Edge Avri: {e}")
                     return self._synthesize_edge(text, "edge-he-avri", speed)
-            return self._synthesize_edge(text, "edge-he-avri", speed)
+            else:
+                return self._synthesize_edge(text, "edge-he-avri", speed)
 
-        # Edge TTS voices (Hebrew Avri/Hila or English Jenny/Guy)
+        # Edge TTS voices (and default cloud routing for English voices so CPU usage stays at 0%)
         if voice and voice.startswith("edge-"):
             return self._synthesize_edge(text, voice, speed)
 
-        if lang == "en" and self._kokoro:
-            kokoro_voice = voice if voice and voice.startswith(("af_", "am_", "bf_", "bm_")) else "af_sarah"
-            samples, sample_rate = self._kokoro.create(
-                text,
-                voice=kokoro_voice,
-                speed=float(speed),
-                lang="en-us",
-            )
-            # Write WAV bytes in-memory
-            buf = io.BytesIO()
-            sf.write(buf, samples, sample_rate, format="WAV")
-            audio_bytes = buf.getvalue()
-            duration = float(len(samples)) / float(sample_rate)
+        # ElevenLabs Multilingual v2
+        if voice and voice.startswith("eleven-"):
+            return self._synthesize_elevenlabs(text, voice, speed)
 
-            return SynthesisResult(
-                audio_bytes=audio_bytes,
-                sample_rate=sample_rate,
-                duration_seconds=duration,
-                language="en",
-            )
+        if lang == "en" and os.environ.get("USE_LOCAL_KOKORO") == "1":
+            if self.kokoro is None:
+                self._init_kokoro()
+            if self.kokoro:
+                kokoro_voice = voice if voice and voice.startswith(("af_", "am_", "bf_", "bm_")) else "af_sarah"
+                voice_speed_factor = 0.88 if kokoro_voice == "am_michael" else 0.94
+                effective_speed = max(0.5, min(2.5, float(speed) * voice_speed_factor))
+                clean_text = prepare_text_for_tts(text, "en")
+                kokoro_lang = "en-gb" if kokoro_voice.startswith(("bf_", "bm_")) else "en-us"
+                with _kokoro_infer_lock:
+                    samples, sample_rate = self.kokoro.create(
+                        clean_text,
+                        voice=kokoro_voice,
+                        speed=effective_speed,
+                        lang=kokoro_lang,
+                    )
+                samples = trim_silence(np.asarray(samples, dtype=np.float32), sample_rate, threshold=0.01, pad_ms=16)
+                buf = io.BytesIO()
+                sf.write(buf, samples, sample_rate, format="WAV")
+                audio_bytes = buf.getvalue()
+                duration = float(len(samples)) / float(sample_rate)
+
+                return SynthesisResult(
+                    audio_bytes=audio_bytes,
+                    sample_rate=sample_rate,
+                    duration_seconds=duration,
+                    language="en",
+                )
 
         if lang == "en":
-            return self._synthesize_native(text, speed, lang)
+            return self._synthesize_edge(text, voice or "edge-en-jenny", speed)
 
-        # Hebrew synthesis strictly via Edge TTS (Avri/Hila), zero Carmit fallback
+        # Hebrew synthesis strictly via Edge TTS (Avri/Hila/Multilingual), zero Carmit fallback
         return self._synthesize_edge(text, voice or "edge-he-avri", speed)
 
     def _synthesize_roboshaul(self, text: str, speed: float) -> SynthesisResult:
@@ -366,61 +519,174 @@ class SpeechEngine:
         voice: str | None,
         speed: float,
     ) -> SynthesisResult:
-        """Synthesize text via Edge TTS (Avri/Hila for Hebrew, Jenny/Guy for English)."""
+        """Synthesize text via Edge TTS (Native Hebrew, Multilingual V2, and US/UK English Neural)."""
         lang = detect_language(text)
-        if lang == "he" or (voice and "he-" in voice):
-            edge_voice = "he-IL-HilaNeural" if (voice and "hila" in voice.lower()) else "he-IL-AvriNeural"
+        v_low = (voice or "").lower()
+        pitch_str = "+0Hz"
+        extra_rate = 0
+        if lang == "he" or "he-" in v_low:
+            if "hila" in v_low:
+                edge_voice = "he-IL-HilaNeural"
+            elif "ava" in v_low or "noa" in v_low:
+                edge_voice = "he-IL-HilaNeural"
+                pitch_str = "-5Hz"
+                extra_rate = -2
+            elif "emma" in v_low or "maya" in v_low:
+                edge_voice = "he-IL-HilaNeural"
+                pitch_str = "+5Hz"
+                extra_rate = 2
+            elif "andrew" in v_low or "oren" in v_low:
+                edge_voice = "he-IL-AvriNeural"
+                pitch_str = "-6Hz"
+                extra_rate = -3
+            elif "brian" in v_low or "yonatan" in v_low:
+                edge_voice = "he-IL-AvriNeural"
+                pitch_str = "+4Hz"
+                extra_rate = 3
+            else:
+                edge_voice = "he-IL-AvriNeural"
             result_lang = "he"
         else:
-            edge_voice = "en-US-GuyNeural" if (voice and "guy" in voice.lower()) else "en-US-JennyNeural"
+            if "andrew" in v_low or v_low in ("am_adam", "am_liam"):
+                edge_voice = "en-US-AndrewMultilingualNeural"
+            elif "ava" in v_low or v_low in ("af_heart", "af_sky"):
+                edge_voice = "en-US-AvaMultilingualNeural"
+            elif "brian" in v_low or v_low in ("am_echo", "am_puck"):
+                edge_voice = "en-US-BrianMultilingualNeural"
+            elif v_low == "bf_emma" or "sonia" in v_low:
+                edge_voice = "en-GB-SoniaNeural"
+            elif "emma" in v_low or v_low in ("af_nova", "af_alloy"):
+                edge_voice = "en-US-EmmaMultilingualNeural"
+            elif "aria" in v_low or v_low == "af_bella":
+                edge_voice = "en-US-AriaNeural"
+            elif "christopher" in v_low or v_low in ("am_onyx", "am_fenrir"):
+                edge_voice = "en-US-ChristopherNeural"
+            elif "ryan" in v_low or v_low in ("bm_george", "bm_fable"):
+                edge_voice = "en-GB-RyanNeural"
+            elif "guy" in v_low or v_low == "am_michael":
+                edge_voice = "en-US-GuyNeural"
+            else:
+                edge_voice = "en-US-JennyNeural"
             result_lang = "en"
 
         # Calculate rate string e.g. "+10%", "-20%"
-        rate_val = int(round((speed - 1.0) * 100))
+        rate_val = int(round((speed - 1.0) * 100)) + extra_rate
         rate_str = f"{rate_val:+d}%" if rate_val != 0 else "+0%"
+        clean_text = prepare_text_for_tts(text, result_lang)
 
+        cache_key = (clean_text.strip(), edge_voice, rate_str, pitch_str)
+        if cache_key in self._edge_cache:
+            return self._edge_cache[cache_key]
+
+        last_err = None
+        with _edge_semaphore:
+            for attempt in range(3):
+                try:
+                    import asyncio
+                    import edge_tts
+
+                    async def _run_edge():
+                        if pitch_str != "+0Hz":
+                            communicate = edge_tts.Communicate(clean_text, edge_voice, rate=rate_str, pitch=pitch_str)
+                        else:
+                            communicate = edge_tts.Communicate(clean_text, edge_voice, rate=rate_str)
+                        chunks = []
+                        async for chunk in communicate.stream():
+                            if chunk["type"] == "audio":
+                                chunks.append(chunk["data"])
+                        return b"".join(chunks)
+
+                    fut = asyncio.run_coroutine_threadsafe(
+                        asyncio.wait_for(_run_edge(), timeout=14.0),
+                        _get_edge_loop(),
+                    )
+                    audio_data = fut.result(timeout=15.0)
+
+                    if audio_data and len(audio_data) > 0:
+                        res = SynthesisResult(
+                            audio_bytes=audio_data,
+                            sample_rate=24000,
+                            duration_seconds=float(len(audio_data)) / 6000.0,
+                            language=result_lang,
+                        )
+                        if len(self._edge_cache) > 128:
+                            self._edge_cache.pop(next(iter(self._edge_cache)))
+                        self._edge_cache[cache_key] = res
+                        return res
+                    raise RuntimeError("Edge TTS returned zero audio bytes")
+                except Exception as e:
+                    last_err = e
+                    if attempt < 2:
+                        time.sleep(0.2 * (attempt + 1))
+
+        print(f"[SpeechEngine] Edge TTS synthesis error ({edge_voice}): {last_err}")
+        if result_lang == "he":
+            raise RuntimeError(f"Edge TTS Hebrew synthesis failed ({edge_voice}): {last_err}")
+        raise RuntimeError(f"Edge TTS synthesis failed ({edge_voice}): {last_err}")
+
+    def _synthesize_elevenlabs(self, text: str, voice: str, speed: float) -> SynthesisResult:
+        """Synthesize text using ElevenLabs Multilingual v2 API with Edge TTS fallback."""
+        import json
+        import urllib.request
+        api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+        lang = detect_language(text)
+        if not api_key:
+            print("[SpeechEngine] ELEVENLABS_API_KEY not set, falling back to Edge TTS")
+            fallback = "edge-he-avri" if lang == "he" else "edge-en-jenny"
+            return self._synthesize_edge(text, fallback, speed)
+
+        voice_ids = {
+            "eleven-rachel": "21m00Tcm4TlvDq8ikWAM",
+            "eleven-adam": "pNInz6obpgDQGcFmaJgB",
+            "eleven-charlie": "IKne3meq5aSn9XLyUdCD",
+        }
+        voice_id = voice_ids.get(voice, "21m00Tcm4TlvDq8ikWAM")
+        clean_text = prepare_text_for_tts(text, lang)
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        payload = json.dumps({
+            "text": clean_text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "xi-api-key": api_key,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg"
+            }
+        )
         try:
-            import asyncio
-            import edge_tts
-
-            async def _run_edge():
-                communicate = edge_tts.Communicate(text, edge_voice, rate=rate_str)
-                chunks = []
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        chunks.append(chunk["data"])
-                return b"".join(chunks)
-
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-
-            if loop and loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    audio_data = pool.submit(lambda: asyncio.run(asyncio.wait_for(_run_edge(), timeout=10.0))).result()
-            else:
-                audio_data = asyncio.run(asyncio.wait_for(_run_edge(), timeout=10.0))
-
-            if audio_data and len(audio_data) > 0:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                audio_bytes = resp.read()
+                trimmed = trim_audio_bytes(audio_bytes, threshold=0.012, pad_ms=25)
+                if trimmed is not None:
+                    trimmed_bytes, sr, dur = trimmed
+                    return SynthesisResult(
+                        audio_bytes=trimmed_bytes,
+                        sample_rate=sr,
+                        duration_seconds=dur,
+                        language=lang,
+                    )
+                duration = max(0.5, len(text) * 0.08 / max(0.5, speed))
                 return SynthesisResult(
-                    audio_bytes=audio_data,
-                    sample_rate=24000,
-                    duration_seconds=float(len(audio_data)) / 48000.0,
-                    language=result_lang,
+                    audio_bytes=audio_bytes,
+                    sample_rate=44100,
+                    duration_seconds=duration,
+                    language=lang,
                 )
-            raise RuntimeError("Edge TTS returned zero audio bytes")
         except Exception as e:
-            print(f"[SpeechEngine] Edge TTS synthesis error ({edge_voice}): {e}")
-            if result_lang == "he":
-                raise RuntimeError(f"Edge TTS Hebrew synthesis failed ({edge_voice}): {e}")
-            raise RuntimeError(f"Edge TTS synthesis failed ({edge_voice}): {e}")
+            print(f"[SpeechEngine] ElevenLabs synthesis failed ({e}), falling back to Edge TTS")
+            fallback = "edge-he-avri" if lang == "he" else "edge-en-jenny"
+            return self._synthesize_edge(text, fallback, speed)
 
     def _synthesize_native(self, text: str, speed: float, language: str) -> SynthesisResult:
         """Render installed macOS speech to WAV for offline English. Never used for Hebrew."""
         if language == "he":
             raise RuntimeError("Carmit Hebrew speech is disabled. Please use Edge Neural voices (Avri/Hila).")
+        if not Path("/usr/bin/say").exists():
+            return self._synthesize_edge(text, "edge-en-guy", speed)
         try:
             listing = subprocess.run(
                 ["/usr/bin/say", "-v", "?"], capture_output=True, text=True,
@@ -515,9 +781,95 @@ def shutdown():
     return {"status": "shutting_down"}
 
 
+window_action_callbacks: list = []
+
+
+class WindowActionRequest(BaseModel):
+    action: str
+    width: float | None = None
+    height: float | None = None
+    dx: float | None = None
+    dy: float | None = None
+    dw: float | None = None
+    dh: float | None = None
+
+
+import queue
+window_actions_queue: queue.Queue = queue.Queue()
+
+
+@app.post("/window-action")
+def window_action(req: WindowActionRequest):
+    data = req.dict()
+    window_actions_queue.put(data)
+    for cb in list(window_action_callbacks):
+        try:
+            cb(data)
+        except Exception:
+            pass
+    return {"status": "ok"}
+
+
+@app.get("/window-action-poll")
+def window_action_poll():
+    try:
+        action = window_actions_queue.get(timeout=2.0)
+        return {"action": action}
+    except queue.Empty:
+        return {"action": None}
+
+
+@app.get("/clipboard")
+def get_clipboard_text():
+    try:
+        import pyperclip
+        return {"text": pyperclip.paste() or ""}
+    except Exception:
+        return {"text": ""}
+
+
 @app.get("/reader-state")
 def reader_state():
     return browser_state
+
+
+@app.get("/extract-at-point")
+async def extract_at_point(x: float = -1.0, y: float = -1.0, pid: int = 0):
+    """Extract screen text at (x, y) via browser companion extension or helper."""
+    if connected_extensions:
+        ws = active_extension if active_extension in connected_extensions else next(iter(connected_extensions))
+        request_id = uuid.uuid4().hex
+        future = asyncio.get_running_loop().create_future()
+        pending_commands[request_id] = (ws, future)
+        expires_at = int((time.time() + 1.2) * 1000)
+        try:
+            await ws.send_json({
+                "event": "command",
+                "action": "extract-clicked-text",
+                "requestId": request_id,
+                "expiresAt": expires_at,
+            })
+            cmd_res = await asyncio.wait_for(future, timeout=1.2)
+            ext_text = str(cmd_res.get("text", "")).strip() if isinstance(cmd_res, dict) else ""
+            if ext_text:
+                return {
+                    "status": "ok",
+                    "trusted": True,
+                    "source": "extension",
+                    "pid": pid,
+                    "text": ext_text,
+                }
+        except (TimeoutError, RuntimeError, WebSocketDisconnect):
+            pass
+        finally:
+            pending_commands.pop(request_id, None)
+
+    return {
+        "status": "missing_helper",
+        "trusted": False,
+        "pid": pid,
+        "text": "",
+    }
 
 
 @app.post("/trigger")
@@ -535,7 +887,8 @@ async def trigger_endpoint(req: TriggerRequest):
         await ws.send_json({"event": "command", "action": req.action, "mode": req.mode,
                             "voice": req.voice,
                             "requestId": request_id, "expiresAt": expires_at})
-        handled = await asyncio.wait_for(future, timeout=1.5)
+        cmd_res = await asyncio.wait_for(future, timeout=1.5)
+        handled = bool(cmd_res.get("success")) if isinstance(cmd_res, dict) else bool(cmd_res)
         return {"status": "ok" if handled else "no_extension", "dispatched": int(handled)}
     except (TimeoutError, RuntimeError, WebSocketDisconnect):
         return {"status": "no_extension", "dispatched": 0}
@@ -546,17 +899,46 @@ async def trigger_endpoint(req: TriggerRequest):
 @app.get("/health")
 def health():
     voices = [
-        {"id": "af_sarah", "name": "Sarah (American Female)", "lang": "en"},
-        {"id": "am_michael", "name": "Michael (American Male)", "lang": "en"},
+        {"id": "af_heart", "name": "Heart (Warm Expressive Female - Kokoro)", "lang": "en"},
+        {"id": "af_nova", "name": "Nova (OpenAI-Style Clear Female - Kokoro)", "lang": "en"},
+        {"id": "af_alloy", "name": "Alloy (OpenAI-Style Balanced - Kokoro)", "lang": "en"},
+        {"id": "af_sky", "name": "Sky (OpenAI-Style Conversational - Kokoro)", "lang": "en"},
+        {"id": "af_bella", "name": "Bella (Natural American Female - Kokoro)", "lang": "en"},
+        {"id": "af_sarah", "name": "Sarah (American Female - Kokoro)", "lang": "en"},
+        {"id": "am_onyx", "name": "Onyx (OpenAI-Style Deep Male - Kokoro)", "lang": "en"},
+        {"id": "am_echo", "name": "Echo (OpenAI-Style Warm Male - Kokoro)", "lang": "en"},
+        {"id": "am_puck", "name": "Puck (Conversational Male - Kokoro)", "lang": "en"},
+        {"id": "am_fenrir", "name": "Fenrir (Rich Narrator Male - Kokoro)", "lang": "en"},
+        {"id": "am_adam", "name": "Adam (Clear American Male - Kokoro)", "lang": "en"},
+        {"id": "am_liam", "name": "Liam (Smooth American Male - Kokoro)", "lang": "en"},
+        {"id": "am_michael", "name": "Michael (American Male - Kokoro)", "lang": "en"},
+        {"id": "bm_fable", "name": "Fable (OpenAI-Style British Storyteller - Kokoro)", "lang": "en"},
+        {"id": "bm_george", "name": "George (British Male - Kokoro)", "lang": "en"},
+        {"id": "bf_emma", "name": "Emma (British Female - Kokoro)", "lang": "en"},
+        {"id": "edge-en-ava", "name": "Ava (Expressive US Female - Edge AI)", "lang": "en"},
+        {"id": "edge-en-andrew", "name": "Andrew (Warm US Male - Edge AI)", "lang": "en"},
+        {"id": "edge-en-brian", "name": "Brian (Clear US Male - Edge AI)", "lang": "en"},
+        {"id": "edge-en-emma", "name": "Emma (Friendly US Female - Edge AI)", "lang": "en"},
+        {"id": "edge-en-aria", "name": "Aria (Natural US Female - Edge AI)", "lang": "en"},
+        {"id": "edge-en-christopher", "name": "Christopher (Narrator US Male - Edge AI)", "lang": "en"},
         {"id": "edge-en-jenny", "name": "Jenny (English US - Edge AI)", "lang": "en"},
         {"id": "edge-en-guy", "name": "Guy (English US - Edge AI)", "lang": "en"},
+        {"id": "edge-en-sonia", "name": "Sonia (British Female - Edge AI)", "lang": "en"},
+        {"id": "edge-en-ryan", "name": "Ryan (British Male - Edge AI)", "lang": "en"},
         {"id": "he-roboshaul", "name": "Shaul (Hebrew Male - RoboShaul)", "lang": "he"},
         {"id": "edge-he-avri", "name": "Avri (Hebrew Male - Neural)", "lang": "he"},
         {"id": "edge-he-hila", "name": "Hila (Hebrew Female - Neural)", "lang": "he"},
+        {"id": "edge-he-andrew", "name": "Andrew (Hebrew & English Bilingual Male - Neural)", "lang": "he"},
+        {"id": "edge-he-ava", "name": "Ava (Hebrew & English Bilingual Female - Neural)", "lang": "he"},
+        {"id": "edge-he-brian", "name": "Brian (Hebrew & English Bilingual Male - Neural)", "lang": "he"},
+        {"id": "edge-he-emma", "name": "Emma (Hebrew & English Bilingual Female - Neural)", "lang": "he"},
+        {"id": "eleven-rachel", "name": "Rachel (ElevenLabs Multilingual)", "lang": "mul"},
+        {"id": "eleven-adam", "name": "Adam (ElevenLabs Multilingual)", "lang": "mul"},
+        {"id": "eleven-charlie", "name": "Charlie (ElevenLabs Multilingual)", "lang": "mul"},
     ]
     return {
         "status": "ok",
-        "kokoro": engine._kokoro is not None,
+        "kokoro": engine.is_kokoro_available,
         "roboshaul": engine._roboshaul is not None and engine._roboshaul.is_available(),
         "connected_extensions": len(connected_extensions),
         "voices": voices,
@@ -597,13 +979,19 @@ async def websocket_endpoint(websocket: WebSocket):
             if action == "register":
                 await websocket.send_json({"event": "registered", "status": "ok"})
 
+            elif action == "ping":
+                await websocket.send_json({"event": "pong"})
+
             elif action == "focus":
                 active_extension = websocket
 
             elif action == "command-result":
                 pending = pending_commands.get(data.get("requestId"))
                 if pending and pending[0] is websocket and not pending[1].done():
-                    pending[1].set_result(data.get("success") is True)
+                    pending[1].set_result({
+                        "success": data.get("success") is True,
+                        "text": str(data.get("text", "") or ""),
+                    })
 
             elif action == "reader-state":
                 if active_extension is None or active_extension is websocket:
@@ -657,9 +1045,13 @@ if _ui_path.exists():
 
 
 if __name__ == "__main__":
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
     write_pid_file()
     import uvicorn
     try:
-        uvicorn.run(app, host="127.0.0.1", port=5050)
+        uvicorn.run(app, host="127.0.0.1", port=5050, log_config=None)
     finally:
         remove_pid_file()

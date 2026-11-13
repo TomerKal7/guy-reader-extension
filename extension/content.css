@@ -2,21 +2,20 @@
 
 /* Active Sentence Highlight on Webpage */
 .guy-reader-sentence-active {
-  background: rgba(191, 245, 73, 0.22) !important;
+  background: rgba(191, 245, 73, 0.14) !important;
   border-radius: 4px !important;
-  box-shadow: 0 0 0 2px rgba(191, 245, 73, 0.35) !important;
-  transition: background 0.15s ease, box-shadow 0.15s ease !important;
+  transition: background 0.15s ease !important;
 }
 
 /* Active Word Highlight on Webpage */
 .guy-reader-word-active {
-  background: #BFF549 !important;
-  color: #0b0d10 !important;
-  font-weight: 700 !important;
+  background: rgba(191, 245, 73, 0.28) !important;
+  color: inherit !important;
+  font-weight: inherit !important;
   border-radius: 3px !important;
-  padding: 1px 3px !important;
-  box-shadow: 0 1px 6px rgba(191, 245, 73, 0.5) !important;
-  transition: all 0.1s ease !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  box-shadow: none !important;
 }
 
 /* Hover effect on clickable sentences when Guy_reader is active */
@@ -218,23 +217,44 @@
   color: #2d2d2d !important;
 }
 
+.guy-clean-sentence {
+  border-radius: 4px !important;
+  cursor: pointer !important;
+  transition: background-color 0.15s ease, box-shadow 0.15s ease !important;
+}
+.guy-clean-sentence:hover {
+  background: rgba(191, 245, 73, 0.10) !important;
+}
+.guy-clean-word {
+  border-radius: 3px !important;
+  transition: background-color 0.08s ease, color 0.08s ease !important;
+}
+
+.guy-reader-clean-btn.guy-clean-active {
+  background: rgba(191, 245, 73, 0.22) !important;
+  box-shadow: 0 0 0 1px rgba(191, 245, 73, 0.5) !important;
+}
+
 /* Override active highlights inside clean reader */
 #guy-reader-clean-overlay .guy-reader-sentence-active {
-  background: rgba(191, 245, 73, 0.18) !important;
+  background: rgba(191, 245, 73, 0.16) !important;
   border-radius: 4px !important;
-  box-shadow: 0 0 0 2px rgba(191, 245, 73, 0.3) !important;
+  box-shadow: none !important;
 }
 
 #guy-reader-clean-overlay .guy-reader-word-active {
-  background: #BFF549 !important;
-  color: #0b0d10 !important;
+  background: rgba(165, 225, 45, 0.32) !important;
+  color: inherit !important;
+  font-weight: inherit !important;
+  padding: 0 !important;
+  margin: 0 !important;
   border-radius: 3px !important;
-  padding: 1px 3px !important;
+  box-shadow: none !important;
 }
 
 @media (prefers-color-scheme: dark) {
   #guy-reader-clean-overlay {
-    background: #1a1a1a !important;
+    background: #14161a !important;
   }
   .guy-reader-clean-content {
     color: #e8e8e8 !important;
@@ -243,10 +263,49 @@
     color: #f3f4f6 !important;
   }
   .guy-reader-clean-para {
-    color: #d1d1d1 !important;
+    color: #d8dadd !important;
+  }
+  #guy-reader-clean-overlay .guy-reader-sentence-active {
+    background: rgba(191, 245, 73, 0.10) !important;
+    box-shadow: none !important;
+  }
+  #guy-reader-clean-overlay .guy-reader-word-active {
+    background: rgba(191, 245, 73, 0.22) !important;
+    color: inherit !important;
+    box-shadow: none !important;
   }
 }
 
 /* Native Range highlights leave page markup and layout unchanged. */
-::highlight(guy-reader-sentence) { background-color: rgba(191, 245, 73, 0.18); }
-::highlight(guy-reader-word) { background-color: #BFF549; color: #0b0d10; text-decoration: underline; }
+::highlight(guy-reader-sentence) { background-color: rgba(191, 245, 73, 0.13); }
+::highlight(guy-reader-word) { background-color: rgba(191, 245, 73, 0.26); }
+
+/* Floating Quick-Read Button on Selection */
+#guy-reader-selection-btn {
+  position: fixed !important;
+  z-index: 2147483647 !important;
+  display: none;
+  align-items: center !important;
+  justify-content: center !important;
+  background: rgba(15, 17, 21, 0.95) !important;
+  color: #BFF549 !important;
+  border: 1px solid rgba(191, 245, 73, 0.45) !important;
+  border-radius: 9999px !important;
+  padding: 5px 12px !important;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  cursor: pointer !important;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(191, 245, 73, 0.2) !important;
+  user-select: none !important;
+  transition: transform 0.15s ease, background 0.15s ease !important;
+  direction: rtl !important;
+  white-space: nowrap !important;
+}
+#guy-reader-selection-btn:hover {
+  background: #181b20 !important;
+  transform: scale(1.06) !important;
+  border-color: #BFF549 !important;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.6), 0 0 10px rgba(191, 245, 73, 0.5) !important;
+}
+
