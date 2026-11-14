@@ -193,10 +193,46 @@ function cs64Digest(data, digest) {
   return Array.from(csBytes).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
 }
 
-// Generate Sec-MS-GEC v2 Token
+let clockSkewSeconds = 0;
+let lastClockSyncTime = 0;
+
+async function syncClockSkew(force = false) {
+  const nowMs = Date.now();
+  if (!force && lastClockSyncTime > 0 && (nowMs - lastClockSyncTime < 300000)) {
+    return;
+  }
+  const urls = [
+    `https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=${EDGE_TRUSTED_TOKEN}`,
+    'https://www.bing.com/favicon.ico'
+  ];
+  for (const url of urls) {
+    try {
+      const resp = await fetch(url, {
+        method: 'GET',
+        cache: 'no-store',
+        signal: AbortSignal.timeout(3500)
+      });
+      const dateStr = resp.headers.get('date') || resp.headers.get('Date');
+      if (dateStr) {
+        const serverMs = Date.parse(dateStr);
+        if (!Number.isNaN(serverMs) && serverMs > 0) {
+          clockSkewSeconds = (serverMs - Date.now()) / 1000;
+          lastClockSyncTime = Date.now();
+          return;
+        }
+      }
+    } catch (_) {}
+  }
+}
+
+// Generate Sec-MS-GEC v2 Token (with automatic server clock-skew correction)
 async function generateSecMsGec(unixTimestampSec = null) {
+  await syncClockSkew(false);
   const WINDOWS_TICKS_EPOCH = 116444736000000000n;
-  const nowSec = unixTimestampSec !== null ? BigInt(Math.floor(unixTimestampSec)) : BigInt(Math.floor(Date.now() / 1000));
+  const effectiveSec = unixTimestampSec !== null
+    ? Math.floor(unixTimestampSec)
+    : Math.floor((Date.now() / 1000) + clockSkewSeconds);
+  const nowSec = BigInt(effectiveSec);
   let ticks = nowSec * 10000000n + WINDOWS_TICKS_EPOCH;
   ticks -= ticks % 3000000000n; // Round down to 5-minute boundary
 
@@ -401,6 +437,7 @@ async function synthesizeEdgeTTS(text, voiceName = 'edge-he-avri', rate = 1.0) {
       }
     } catch (err) {
       lastErr = err;
+      await syncClockSkew(true);
       if (attempt < 2) {
         await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
       }
@@ -555,10 +592,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'synthesize-edge-tts' || message.action === 'synthesize-local') {
     const rate = message.rate || message.speed || 1.0;
     const runSynthesis = async () => {
-      try {
-        return await synthesizeLocal(message.text, message.voice, rate);
-      } catch (_) {
-        // Automatically fall back to direct browser WebSocket Edge neural synthesis if local engine is closed
+      if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+        try {
+          return await synthesizeLocal(message.text, message.voice, rate);
+        } catch (_) {
+          // Automatically fall back to direct browser WebSocket Edge neural synthesis if local engine fails
+        }
       }
       return await synthesizeEdgeTTS(message.text, message.voice, rate);
     };
