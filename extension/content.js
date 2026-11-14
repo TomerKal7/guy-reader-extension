@@ -787,44 +787,12 @@
   }
 
   function setupSelectionHandlers() {
-    let tooltipDebounce = null;
     document.addEventListener('selectionchange', () => {
       updateLastSelection();
-      if (tooltipDebounce) clearTimeout(tooltipDebounce);
-      tooltipDebounce = setTimeout(() => {
-        const sel = window.getSelection ? window.getSelection() : null;
-        if (sel && !sel.isCollapsed && sel.toString().trim().length >= 2) {
-          try {
-            const rect = sel.getRangeAt(0).getBoundingClientRect();
-            showSelectionTooltip(rect);
-          } catch (_) {}
-        }
-      }, 180);
     }, { passive: true });
 
-    document.addEventListener('mouseup', (e) => {
+    document.addEventListener('mouseup', () => {
       updateLastSelection();
-      if (e.target.closest?.('#guy-reader-floating-pill, #guy-reader-selection-btn, input, textarea')) return;
-      const cx = e.clientX, cy = e.clientY;
-      setTimeout(() => {
-        const sel = window.getSelection ? window.getSelection() : null;
-        if (sel && !sel.isCollapsed && sel.toString().trim().length >= 2) {
-          try {
-            const rect = sel.getRangeAt(0).getBoundingClientRect();
-            showSelectionTooltip(rect, cx, cy);
-          } catch (_) {
-            showSelectionTooltip(null, cx, cy);
-          }
-        } else {
-          hideSelectionTooltip();
-        }
-      }, 30);
-    }, { passive: true });
-
-    document.addEventListener('mousedown', (e) => {
-      if (!e.target.closest?.('#guy-reader-selection-btn')) {
-        hideSelectionTooltip();
-      }
     }, { passive: true });
   }
 
