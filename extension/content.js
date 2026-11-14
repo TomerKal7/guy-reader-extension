@@ -959,20 +959,14 @@
       }
     }
 
-    // 1. Fetch current sentence immediately and start prefetching next sentence right behind it
+    // 1. Fetch current sentence immediately and launch staggered parallel prefetch for next 4 sentences
     const currentAudioPromise = prefetchSentence(index, offset);
-    if (index + 1 < state.sentences.length) {
-      setTimeout(() => {
-        if (state.isActive && state.generation === currentGen) {
-          prefetchSentence(index + 1);
-        }
-      }, 60);
-    }
+    scheduleLookaheadPrefetch(index, currentGen);
     const audioDataUrl = await currentAudioPromise;
     if (state.sequenceId !== mySeq) return; // Stale or canceled
 
     if (audioDataUrl) {
-      prefetchSentence(index + 1);
+      scheduleLookaheadPrefetch(index, currentGen);
       playAudioUrl(audioDataUrl, textToSpeak, mySeq, true, offset);
       return;
     }
@@ -1049,6 +1043,18 @@
     speakWebSpeech(text, sequence, offset, segments);
   }
 
+  function scheduleLookaheadPrefetch(fromIndex, gen = state.generation) {
+    const maxAhead = Math.min(state.sentences.length - 1, fromIndex + 4);
+    for (let i = fromIndex + 1, step = 0; i <= maxAhead; i++, step++) {
+      const delay = 120 + step * 180;
+      setTimeout(() => {
+        if (state.isActive && state.generation === gen && i >= state.currentIndex) {
+          prefetchSentence(i);
+        }
+      }, delay);
+    }
+  }
+
   function prefetchSentence(index, offset = 0) {
     const item = state.sentences[index];
     if (!item) return Promise.resolve(null);
@@ -1072,7 +1078,7 @@
         }, resp => {
           const audioUrl = (generation === state.generation && !chrome.runtime.lastError && resp?.success) ? resp.audioDataUrl : null;
           resolve(audioUrl);
-          if (audioUrl && index + 1 < state.sentences.length && (state.currentIndex < 0 || index + 1 <= state.currentIndex + 3)) {
+          if (audioUrl && index + 1 < state.sentences.length && (state.currentIndex < 0 || index + 1 <= state.currentIndex + 4)) {
             prefetchSentence(index + 1);
           }
         });
@@ -1084,9 +1090,10 @@
         state.prefetch.delete(key);
       }
     });
-    // Keep a sliding window of prefetch
+    // Keep a sliding window relative to currentIndex (never evict upcoming prefetched sentences!)
+    const minKeep = Math.max(0, state.currentIndex - 1);
     for (const old of state.prefetch.keys()) {
-      if (Number(old.split(':')[0]) < index - 1) state.prefetch.delete(old);
+      if (Number(old.split(':')[0]) < minKeep) state.prefetch.delete(old);
     }
     return request;
   }

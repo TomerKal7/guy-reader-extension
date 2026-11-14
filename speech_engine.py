@@ -332,7 +332,7 @@ _shared_kokoro = None
 _shared_roboshaul = None
 _shared_engine_lock = threading.Lock()
 _kokoro_infer_lock = threading.Lock()
-_edge_semaphore = threading.Semaphore(4)
+_edge_semaphore = threading.Semaphore(6)
 _edge_loop: asyncio.AbstractEventLoop | None = None
 _edge_loop_lock = threading.Lock()
 
