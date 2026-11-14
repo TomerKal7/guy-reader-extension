@@ -6,6 +6,12 @@ Unified, local-first speech synthesis for English (Kokoro-82M) and Hebrew (Phoni
 from __future__ import annotations
 import os
 import sys
+
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
 import signal
 import threading
 import atexit
